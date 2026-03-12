@@ -1,6 +1,6 @@
 # reports/telegram_bot.py
 """
-Telegram бот для отправки уведомлений о сделках и отчетах.
+Telegram бот с системой подписки для уведомлений о сделках
 """
 
 import asyncio
@@ -9,6 +9,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 import pandas as pd
 from pathlib import Path
 import os
+import json
 from dotenv import load_dotenv
 import sys
 from datetime import datetime
@@ -21,308 +22,374 @@ load_dotenv()
 
 class TelegramNotifier:
     """
-    Отправка уведомлений о результатах торговли в Telegram.
+    Отправка уведомлений с поддержкой множественных подписчиков
     """
 
     def __init__(self):
-        """Инициализация Telegram бота."""
+        """Инициализация Telegram бота"""
         self.token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.admin_chat_id = os.getenv('TELEGRAM_ADMIN_ID')
         self.bot = None
         self.application = None
 
-        if self.token and self.chat_id:
+        # Создаем папку data если её нет
+        data_dir = Path(__file__).parent.parent / "data"
+        data_dir.mkdir(exist_ok=True)
+
+        self.subscribers_file = data_dir / "subscribers.json"
+        self.subscribers = set()
+
+        # Статистика
+        self.signals_sent_today = 0
+        self.last_signal_time = None
+        self.last_signal_price = 0
+
+        if self.token:
             self.bot = Bot(token=self.token)
+            self._load_subscribers()
             self._setup_commands()
-            log.info("✅ Telegram бот инициализирован")
+
+            # Добавляем админа автоматически
+            if self.admin_chat_id and self.admin_chat_id.isdigit():
+                admin_id = int(self.admin_chat_id)
+                if admin_id not in self.subscribers:
+                    self.subscribers.add(admin_id)
+                    self._save_subscribers()
+                    print(f"✅ Админ {admin_id} автоматически добавлен в подписчики")
+
+            log.info(f"✅ Telegram бот инициализирован. Подписчиков: {len(self.subscribers)}")
         else:
-            log.warning("⚠️ Telegram не настроен. Укажите TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env")
+            log.warning("⚠️ Telegram не настроен. Укажите TELEGRAM_BOT_TOKEN в .env")
+
+    def _load_subscribers(self):
+        """Загружает список подписчиков из файла"""
+        try:
+            print(f"🔍 Загрузка подписчиков из: {self.subscribers_file}")
+
+            if self.subscribers_file.exists():
+                with open(self.subscribers_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.subscribers = set(data.get('subscribers', []))
+                print(f"✅ Загружено {len(self.subscribers)} подписчиков")
+            else:
+                print(f"📁 Файл {self.subscribers_file} не существует, будет создан при первой подписке")
+                self.subscribers = set()
+        except Exception as e:
+            print(f"⚠️ Ошибка загрузки подписчиков: {e}")
+            self.subscribers = set()
+
+    def _save_subscribers(self):
+        """Сохраняет список подписчиков в файл"""
+        try:
+            print(f"💾 Сохранение {len(self.subscribers)} подписчиков в {self.subscribers_file}")
+
+            # Убедимся что папка существует
+            self.subscribers_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self.subscribers_file, 'w', encoding='utf-8') as f:
+                json.dump({'subscribers': list(self.subscribers)}, f, indent=2)
+
+            print(f"✅ Подписчики сохранены")
+
+            # Проверим что файл создался
+            if self.subscribers_file.exists():
+                print(f"📁 Файл создан: {self.subscribers_file}")
+        except Exception as e:
+            print(f"⚠️ Ошибка сохранения подписчиков: {e}")
 
     def _setup_commands(self):
-        """Настройка команд бота."""
+        """Настройка команд бота"""
         self.application = Application.builder().token(self.token).build()
 
-        # Добавляем обработчики команд
+        # Основные команды
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(CommandHandler("report", self.report_command))
-        self.application.add_handler(CommandHandler("trades", self.trades_command))
+
+        # Команды подписки
+        self.application.add_handler(CommandHandler("subscribe", self.subscribe_command))
+        self.application.add_handler(CommandHandler("unsubscribe", self.unsubscribe_command))
+
+        # Информационные команды
         self.application.add_handler(CommandHandler("stats", self.stats_command))
-        self.application.add_handler(CommandHandler("drawdown", self.drawdown_command))
+        self.application.add_handler(CommandHandler("last", self.last_signal_command))
+        self.application.add_handler(CommandHandler("subs", self.list_subscribers_command))
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start."""
-        await update.message.reply_text(
-            "🤖 <b>Привет! Я бот для мониторинга торговой стратегии.</b>\n\n"
-            "📊 <b>Доступные команды:</b>\n"
-            "/status - текущий статус (баланс, открытые позиции)\n"
-            "/report - последний отчет\n"
-            "/trades - последние сделки\n"
-            "/stats - статистика за сегодня\n"
-            "/drawdown - информация о просадке\n"
-            "/help - помощь\n\n"
-            "🔔 Я буду автоматически присылать уведомления о новых сделках.",
-            parse_mode='HTML'
+        """Обработчик команды /start - приветствие и автоматическая подписка"""
+        user = update.effective_user
+        chat_id = update.effective_chat.id
+
+        print(f"\n👤 ПОЛУЧЕН START от {user.first_name} (ID: {chat_id})")
+        print(f"Текущих подписчиков до добавления: {len(self.subscribers)}")
+
+        # Автоматически подписываем пользователя
+        if chat_id not in self.subscribers:
+            self.subscribers.add(chat_id)
+            self._save_subscribers()
+            print(f"✅ Новый подписчик добавлен! Теперь подписчиков: {len(self.subscribers)}")
+            log.info(f"✅ Новый подписчик: {user.first_name} (ID: {chat_id})")
+
+            # Отправляем приветственное сообщение админу
+            if self.admin_chat_id and self.admin_chat_id.isdigit():
+                try:
+                    await self.bot.send_message(
+                        chat_id=int(self.admin_chat_id),
+                        text=f"👤 Новый подписчик: {user.first_name} (@{user.username})\nID: {chat_id}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+        else:
+            print(f"⏺ Пользователь уже был подписан")
+
+        welcome_message = (
+            f"👋 <b>Привет, {user.first_name}!</b>\n\n"
+            f"✅ Вы подписаны на торговые сигналы!\n"
+            f"📊 Теперь вы будете получать уведомления о сделках.\n\n"
+            f"<b>Доступные команды:</b>\n"
+            f"/help - список всех команд\n"
+            f"/status - текущий статус\n"
+            f"/stats - статистика бота\n"
+            f"/last - последний сигнал\n"
+            f"/unsubscribe - отписаться от уведомлений"
         )
+
+        await update.message.reply_text(welcome_message, parse_mode='HTML')
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /help."""
-        await update.message.reply_text(
+        """Обработчик команды /help"""
+        help_text = (
             "📚 <b>Справка по командам:</b>\n\n"
-            "<b>/status</b> - текущий баланс и открытые позиции\n"
-            "<b>/report</b> - получить последний HTML отчет\n"
-            "<b>/trades [N]</b> - последние N сделок (по умолчанию 5)\n"
-            "<b>/stats</b> - статистика за сегодня\n"
-            "<b>/drawdown</b> - информация о текущей просадке\n"
-            "<b>/help</b> - эта справка",
-            parse_mode='HTML'
+            "<b>📊 Основные:</b>\n"
+            "/status - текущий статус\n"
+            "/last - последний сигнал\n\n"
+            "<b>🔔 Подписка:</b>\n"
+            "/subscribe - подписаться\n"
+            "/unsubscribe - отписаться\n\n"
+            "<b>📈 Информация:</b>\n"
+            "/stats - статистика бота\n"
+            "/subs - список подписчиков (только админ)\n"
+            "/help - эта справка"
         )
+        await update.message.reply_text(help_text, parse_mode='HTML')
 
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /status."""
-        # Здесь должна быть логика получения текущего статуса
-        # Это заглушка, нужно будет подключить к реальным данным
-        await update.message.reply_text(
-            "📊 <b>Текущий статус:</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            "💰 Баланс: $10,000.00\n"
-            "📈 Открытых позиций: 0\n"
-            "📊 Прибыль сегодня: $0.00\n"
-            "📉 Прибыль за неделю: $0.00\n"
-            "⚠️ Текущая просадка: 0.00%",
-            parse_mode='HTML'
-        )
+    async def subscribe_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ручная подписка на уведомления"""
+        chat_id = update.effective_chat.id
 
-    async def report_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /report - отправляет последний отчет."""
-        await update.message.reply_text("🔍 Поиск последнего отчета...")
+        if chat_id in self.subscribers:
+            await update.message.reply_text("✅ Вы уже подписаны на уведомления!")
+        else:
+            self.subscribers.add(chat_id)
+            self._save_subscribers()
+            await update.message.reply_text(
+                "✅ Вы успешно подписались на торговые сигналы!\n"
+                "Теперь вы будете получать уведомления о сделках."
+            )
+            log.info(f"✅ Ручная подписка: {chat_id}")
 
-        # Ищем последний HTML отчет
-        reports_dir = Path("reports")
-        if reports_dir.exists():
-            html_files = list(reports_dir.glob("*.html"))
-            if html_files:
-                latest_report = max(html_files, key=lambda p: p.stat().st_mtime)
+    async def unsubscribe_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отписка от уведомлений"""
+        chat_id = update.effective_chat.id
 
-                # Отправляем как документ
-                await update.message.reply_document(
-                    document=open(latest_report, 'rb'),
-                    filename=latest_report.name,
-                    caption=f"📊 <b>Торговый отчет</b>\nФайл: {latest_report.name}",
-                    parse_mode='HTML'
-                )
-
-                # Также отправляем превью (первую картинку, если есть)
-                preview_path = reports_dir / "plots" / "latest_preview.png"
-                if preview_path.exists():
-                    await update.message.reply_photo(
-                        photo=open(preview_path, 'rb'),
-                        caption="📈 Предварительный просмотр"
-                    )
-                return
-
-        await update.message.reply_text("❌ Отчеты не найдены")
-
-    async def trades_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /trades - информация о последних сделках."""
-        # Получаем количество сделок из аргументов
-        n = 5
-        if context.args and context.args[0].isdigit():
-            n = min(int(context.args[0]), 20)  # Не больше 20
-
-        # Здесь должна быть логика получения последних сделок
-        # Это заглушка
-        trades_text = f"📈 <b>Последние {n} сделок:</b>\n━━━━━━━━━━━━━━━\n"
-
-        for i in range(n):
-            trades_text += (
-                f"\n<b>Сделка {i + 1}:</b>\n"
-                f"  • Вход: BUY XAUUSD @ 1950.30\n"
-                f"  • Выход: @ 1955.45\n"
-                f"  • P&L: <b>+$51.50</b> (+2.64%)\n"
-                f"  • Время: 2024-01-15 14:30\n"
-                f"  • Результат: ✅ Take Profit\n"
+        if chat_id in self.subscribers:
+            self.subscribers.remove(chat_id)
+            self._save_subscribers()
+            await update.message.reply_text(
+                "❌ Вы отписались от уведомлений.\n"
+                "Чтобы подписаться снова, используйте /subscribe"
+            )
+            log.info(f"❌ Отписка: {chat_id}")
+        else:
+            await update.message.reply_text(
+                "Вы не подписаны на уведомления.\n"
+                "Используйте /subscribe для подписки."
             )
 
-        await update.message.reply_text(trades_text, parse_mode='HTML')
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Текущий статус бота"""
+        status_text = (
+            "📊 <b>Текущий статус:</b>\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"👥 Подписчиков: {len(self.subscribers)}\n"
+            f"🟢 Бот активен\n"
+            f"📊 Сигналов сегодня: {self.signals_sent_today}\n"
+            f"🕒 Последний сигнал: {self.last_signal_time.strftime('%H:%M') if self.last_signal_time else 'нет'}\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        await update.message.reply_text(status_text, parse_mode='HTML')
 
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /stats - статистика за сегодня."""
-        # Здесь должна быть логика получения статистики
-        # Это заглушка
-        await update.message.reply_text(
-            "📊 <b>Статистика за сегодня:</b>\n"
+        """Статистика бота"""
+        stats_text = (
+            "📈 <b>Статистика бота:</b>\n"
             "━━━━━━━━━━━━━━━\n"
-            "💰 Прибыль: +$124.50\n"
-            "📊 Сделок: 3\n"
-            "✅ Прибыльных: 2 (66.7%)\n"
-            "❌ Убыточных: 1 (33.3%)\n"
-            "📈 Лучшая сделка: +$85.30\n"
-            "📉 Худшая сделка: -$23.40\n"
-            "⚡ Профит-фактор: 2.15",
-            parse_mode='HTML'
+            f"👥 Всего подписчиков: {len(self.subscribers)}\n"
+            f"📊 Сигналов сегодня: {self.signals_sent_today}\n"
+            f"🕒 Последний сигнал: {self.last_signal_time.strftime('%H:%M') if self.last_signal_time else 'нет'}\n"
+            f"💰 Последняя цена: ${self.last_signal_price:.2f}\n"
+            f"🤖 Версия: 2.1 (с анти-дублем)"
         )
+        await update.message.reply_text(stats_text, parse_mode='HTML')
 
-    async def drawdown_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /drawdown - информация о просадке."""
-        # Здесь должна быть логика получения информации о просадке
-        # Это заглушка
+    async def last_signal_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Последний отправленный сигнал"""
+        if self.last_signal_time:
+            await update.message.reply_text(
+                f"🔄 <b>Последний сигнал:</b>\n"
+                f"Время: {self.last_signal_time.strftime('%H:%M:%S')}\n"
+                f"Цена: ${self.last_signal_price:.2f}",
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text("❌ Сигналов пока не было")
+
+    async def list_subscribers_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Список подписчиков (только для админа)"""
+        chat_id = update.effective_chat.id
+
+        # Проверяем что это админ
+        if str(chat_id) != self.admin_chat_id:
+            await update.message.reply_text("⛔ Доступ запрещен")
+            return
+
+        subscribers_list = "\n".join([f"• {id}" for id in self.subscribers])
         await update.message.reply_text(
-            "📉 <b>Анализ просадки:</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            "📊 Текущая просадка: 3.2%\n"
-            "📈 Максимальная просадка: 12.5%\n"
-            "⏱ Длительность: 5 дней\n"
-            "🔄 Восстановление: 80%\n"
-            "📅 Дата макс. просадки: 2024-01-10\n\n"
-            "⚠️ <i>Текущая просадка в пределах нормы</i>",
+            f"📋 <b>Список подписчиков ({len(self.subscribers)}):</b>\n{subscribers_list}",
             parse_mode='HTML'
         )
 
     async def send_message(self, message: str, parse_mode: str = 'HTML'):
         """
-        Отправляет сообщение в Telegram.
-
-        Args:
-            message: текст сообщения
-            parse_mode: режим парсинга ('HTML' или 'Markdown')
+        Отправляет сообщение ВСЕМ подписчикам с обработкой ошибок
         """
-        if not self.bot or not self.chat_id:
-            log.warning("❌ Telegram не настроен")
+        if not self.bot:
+            print("❌ Бот не инициализирован")
             return
 
-        try:
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode=parse_mode
-            )
-            log.info("✅ Сообщение отправлено в Telegram")
-        except Exception as e:
-            log.error(f"❌ Ошибка отправки в Telegram: {e}")
+        if not self.subscribers:
+            print("❌ Нет подписчиков для рассылки")
+            return
+
+        print(f"📨 Рассылка сообщения {len(self.subscribers)} подписчикам...")
+        success_count = 0
+        fail_count = 0
+        removed = []
+
+        for chat_id in list(self.subscribers):
+            try:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode=parse_mode
+                )
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                error_text = str(e)
+                print(f"❌ Ошибка для {chat_id}: {error_text}")
+
+                # Если бот заблокирован или чат не найден - удаляем из подписчиков
+                if "Forbidden" in error_text or "bot was blocked" in error_text or "Chat not found" in error_text:
+                    removed.append(chat_id)
+
+        # Удаляем заблокировавших бота
+        for chat_id in removed:
+            self.subscribers.remove(chat_id)
+            print(f"🗑 Удален неактивный подписчик {chat_id}")
+
+        if removed:
+            self._save_subscribers()
+
+        print(f"✅ Рассылка завершена: {success_count} успешно, {fail_count} ошибок")
+
+        # Отправляем отчет админу
+        if self.admin_chat_id and self.admin_chat_id.isdigit() and fail_count > 0:
+            try:
+                await self.bot.send_message(
+                    chat_id=int(self.admin_chat_id),
+                    text=f"📊 Отчет о рассылке:\n✅ Успешно: {success_count}\n❌ Ошибок: {fail_count}\n🗑 Удалено: {len(removed)}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
 
     async def send_photo(self, photo_path: Path, caption: str = ""):
-        """
-        Отправляет фото в Telegram.
-
-        Args:
-            photo_path: путь к фото
-            caption: подпись к фото
-        """
-        if not self.bot or not self.chat_id:
+        """Отправляет фото всем подписчикам"""
+        if not self.bot or not self.subscribers:
             return
 
-        try:
-            with open(photo_path, 'rb') as photo:
-                await self.bot.send_photo(
-                    chat_id=self.chat_id,
-                    photo=photo,
-                    caption=caption
-                )
-            log.info(f"✅ Фото отправлено в Telegram: {photo_path.name}")
-        except Exception as e:
-            log.error(f"❌ Ошибка отправки фото: {e}")
+        print(f"📸 Отправка фото {len(self.subscribers)} подписчикам...")
+        success_count = 0
+        removed = []
 
-    async def send_document(self, document_path: Path, caption: str = ""):
+        for chat_id in list(self.subscribers):
+            try:
+                with open(photo_path, 'rb') as photo:
+                    await self.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo,
+                        caption=caption
+                    )
+                success_count += 1
+            except Exception as e:
+                print(f"❌ Ошибка отправки фото для {chat_id}: {e}")
+                if "Forbidden" in str(e) or "bot was blocked" in str(e):
+                    removed.append(chat_id)
+
+        for chat_id in removed:
+            self.subscribers.remove(chat_id)
+
+        if removed:
+            self._save_subscribers()
+
+        print(f"✅ Фото отправлено {success_count} подписчикам")
+
+    def send_signal(self, signal_data: dict):
         """
-        Отправляет документ в Telegram.
-
-        Args:
-            document_path: путь к документу
-            caption: подпись к документу
+        Отправляет торговый сигнал всем подписчикам
         """
-        if not self.bot or not self.chat_id:
-            return
+        action = signal_data.get('action', signal_data.get('trend', 'UNKNOWN'))
+        emoji = "🟢" if action == 'BUY' else "🔴" if action == 'SELL' else "⚪"
 
-        try:
-            with open(document_path, 'rb') as doc:
-                await self.bot.send_document(
-                    chat_id=self.chat_id,
-                    document=doc,
-                    filename=document_path.name,
-                    caption=caption
-                )
-            log.info(f"✅ Документ отправлен в Telegram: {document_path.name}")
-        except Exception as e:
-            log.error(f"❌ Ошибка отправки документа: {e}")
+        # Обновляем статистику
+        self.signals_sent_today += 1
+        self.last_signal_time = datetime.now()
+        self.last_signal_price = signal_data.get('price', 0)
 
-    def send_trade_notification(self, trade_data: dict):
-        """
-        Отправляет уведомление о новой сделке.
+        # Формируем сообщение (оно уже отформатировано в dynamic_level_bot)
+        message = signal_data.get('formatted_message', '')
 
-        Args:
-            trade_data: данные сделки
-        """
-        emoji = "🟢" if trade_data.get('pnl', 0) > 0 else "🔴"
+        if message:
+            asyncio.create_task(self.send_message(message))
+        else:
+            # Если сообщение не передано, используем простой формат
+            price = signal_data.get('price', 0)
+            zone = signal_data.get('zone', {})
 
-        message = (
-            f"{emoji} <b>Новая сделка</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"Инструмент: {trade_data.get('symbol', 'Unknown')}\n"
-            f"Направление: {trade_data.get('position', 'Unknown').upper()}\n"
-            f"Цена входа: ${trade_data.get('entry_price', 0):.2f}\n"
-            f"Цена выхода: ${trade_data.get('exit_price', 0):.2f}\n"
-            f"Объем: {trade_data.get('size', 0):.2f} лотов\n"
-            f"P&L: <b>${trade_data.get('pnl', 0):.2f}</b> ({trade_data.get('pnl_pct', 0):+.2f}%)\n"
-            f"Причина: {trade_data.get('exit_reason', 'Unknown')}\n"
-            f"Время: {trade_data.get('exit_time', datetime.now()).strftime('%Y-%m-%d %H:%M')}"
-        )
-
-        asyncio.create_task(self.send_message(message))
-
-    def send_daily_report(self, metrics: dict):
-        """
-        Отправляет ежедневный отчет.
-
-        Args:
-            metrics: метрики за день
-        """
-        message = (
-            "📊 <b>Ежедневный отчет</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"📅 Дата: {datetime.now().strftime('%Y-%m-%d')}\n"
-            f"💰 Баланс: ${metrics.get('balance', 0):,.2f}\n"
-            f"📈 Прибыль сегодня: ${metrics.get('daily_pnl', 0):,.2f}\n"
-            f"📊 Сделок сегодня: {metrics.get('trades_today', 0)}\n"
-            f"✅ Винрейт: {metrics.get('win_rate', 0) * 100:.1f}%\n"
-            f"📉 Просадка: {metrics.get('drawdown', 0):.2f}%\n"
-            f"⚡ Коэф. Шарпа: {metrics.get('sharpe', 0):.2f}"
-        )
-
-        asyncio.create_task(self.send_message(message))
-
-    def send_alert(self, message: str, alert_type: str = 'info'):
-        """
-        Отправляет alert сообщение.
-
-        Args:
-            message: текст сообщения
-            alert_type: тип alert ('info', 'warning', 'error')
-        """
-        emoji_map = {
-            'info': 'ℹ️',
-            'warning': '⚠️',
-            'error': '❌',
-            'success': '✅'
-        }
-
-        emoji = emoji_map.get(alert_type, 'ℹ️')
-
-        full_message = f"{emoji} <b>{alert_type.upper()}</b>\n{message}"
-        asyncio.create_task(self.send_message(full_message))
+            simple_message = (
+                f"{emoji} <b>ТОРГОВЫЙ СИГНАЛ</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 <b>Действие:</b> {action}\n"
+                f"💰 <b>Цена:</b> ${price:.2f}\n"
+                f"🎯 <b>Зона:</b> ${zone.get('low', 0):.2f} - ${zone.get('high', 0):.2f}\n"
+                f"⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}"
+            )
+            asyncio.create_task(self.send_message(simple_message))
 
     def run_polling(self):
-        """Запускает бота в режиме polling."""
+        """Запускает бота в режиме polling"""
         if self.application:
-            log.info("🤖 Telegram бот запущен в режиме polling...")
+            print("🤖 Telegram бот запущен в режиме polling...")
             self.application.run_polling()
 
     def stop(self):
-        """Останавливает бота."""
+        """Останавливает бота"""
         if self.application:
             self.application.stop()
-            log.info("🤖 Telegram бот остановлен")
+            self._save_subscribers()
+            print("🤖 Telegram бот остановлен")
 
 
 # Создаем глобальный экземпляр

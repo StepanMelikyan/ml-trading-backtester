@@ -1,10 +1,11 @@
 # dynamic_level_bot.py
 """
-Многотаймфреймовый бот с динамическими уровнями входа
+Многотаймфреймовый бот с динамическими уровнями входа и защитой от дублирования сигналов
 - Анализирует тренд на H4/D1
 - Вычисляет зону входа на H1
 - Ждет цену в зоне на M15
 - Динамически обновляет уровень
+- Защита от повторных сигналов
 """
 
 import pandas as pd
@@ -16,7 +17,6 @@ import sys
 import asyncio
 import json
 from collections import deque
-import MetaTrader5 as mt5  
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -36,7 +36,7 @@ from utils.logger import log
 
 class DynamicLevelBot:
     """
-    Бот с динамическими уровнями входа и иерархическим анализом
+    Бот с динамическими уровнями входа и защитой от дублирования сигналов
     """
 
     def __init__(self, symbol="XAUUSD",
@@ -69,11 +69,21 @@ class DynamicLevelBot:
         self.models = {}
         self.features_lists = {}
 
+        # Защита от дублирования сигналов
+        self.last_signal_time = None
+        self.last_signal_price = 0
+        self.last_signal_action = None
+        self.signals_sent_today = 0
+        self.cooldown_minutes = 15  # минимальный интервал между сигналами
+        self.price_tolerance = 5.0  # допуск по цене в долларах
+        self.last_zone_notification = None  # время последнего уведомления о зоне
+
         # Статистика
         self.total_checks = 0
         self.signals_sent = 0
         self.zones_created = 0
         self.zones_cancelled = 0
+        self.duplicates_skipped = 0
         self.start_time = datetime.now()
 
         # История для отладки
@@ -141,6 +151,8 @@ class DynamicLevelBot:
         print(f"Младший TF (вход): {self.junior_tf}")
         print(f"Ширина зоны: ±{self.zone_width_pct}%")
         print(f"Порог уверенности: {self.confidence_threshold * 100:.0f}%")
+        print(f"Интервал между сигналами: {self.cooldown_minutes} мин")
+        print(f"Допуск по цене: ${self.price_tolerance}")
         print(f"Данные: {'Реальные MT5' if self.use_real_mt5 else 'Тестовые'}")
         print(f"{'=' * 60}\n")
 
@@ -350,6 +362,29 @@ class DynamicLevelBot:
 
         return in_zone  # если нет модели, просто по зоне
 
+    def _is_duplicate_signal(self, signal):
+        """
+        Проверяет, является ли сигнал дубликатом недавно отправленного
+        """
+        if not self.last_signal_time:
+            return False
+
+        now = datetime.now()
+        time_diff = (now - self.last_signal_time).total_seconds() / 60  # в минутах
+
+        # Если прошло меньше cooldown_minutes
+        if time_diff < self.cooldown_minutes:
+            # Проверяем, тот же ли это тип сигнала
+            if signal['trend'] == self.last_signal_action:
+                # Проверяем, близка ли цена к предыдущему сигналу
+                price_diff = abs(signal['price'] - self.last_signal_price)
+                if price_diff < self.price_tolerance:
+                    print(f"⏺ Дубликат: {signal['trend']}, цена близка (${price_diff:.2f}), прошло {time_diff:.1f} мин")
+                    self.duplicates_skipped += 1
+                    return True
+
+        return False
+
     def analyze_market(self):
         """
         Полный анализ рынка на всех таймфреймах
@@ -402,7 +437,7 @@ class DynamicLevelBot:
                     'confidence': self.trend_confidence
                 }
 
-                self.signals_sent += 1
+                # Очищаем зону сразу после формирования сигнала
                 self.waiting_for_entry = False
                 self.entry_zone = None
 
@@ -418,7 +453,7 @@ class DynamicLevelBot:
         return signal, trend, self.entry_zone
 
     def format_signal_message(self, signal):
-        """Форматирует сигнал для Telegram"""
+        """Форматирует сигнал для Telegram с TP и SL"""
         if not signal:
             return None
 
@@ -426,20 +461,38 @@ class DynamicLevelBot:
         action = "ПОКУПКА" if signal['trend'] == "BUY" else "ПРОДАЖА"
 
         zone = signal['zone']
+        price = signal['price']
+
+        # Рассчитываем стоп-лосс и тейк-профит
+        if action == "ПРОДАЖА":
+            stop_loss = zone['high'] * 1.002  # стоп на 0.2% выше верхней границы
+            take_profit = zone['low'] * 0.995  # тейк на 0.5% ниже нижней границы
+        else:  # ПОКУПКА
+            stop_loss = zone['low'] * 0.998  # стоп на 0.2% ниже нижней границы
+            take_profit = zone['high'] * 1.005  # тейк на 0.5% выше верхней границы
+
+        # Расчет соотношения риск/прибыль
+        risk = abs(price - stop_loss)
+        reward = abs(take_profit - price)
+        rr_ratio = reward / risk if risk > 0 else 0
 
         message = (
-            f"{emoji} <b>СИГНАЛ НА ВХОД: {self.symbol_name}</b>\n"
+            f"{emoji} <b>ТОРГОВЫЙ СИГНАЛ: {self.symbol_name}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Действие:</b> {action}\n"
-            f"🎯 <b>Целевая цена:</b> ${zone['target']:.2f}\n"
-            f"📈 <b>Зона входа:</b> ${zone['low']:.2f} - ${zone['high']:.2f}\n"
-            f"💰 <b>Текущая цена:</b> ${zone['current_price']:.2f}\n"
-            f"📊 <b>Уверенность:</b> {signal['confidence'] * 100:.1f}%\n"
+            f"💰 <b>Цена входа:</b> ${price:.2f}\n"
+            f"🎯 <b>Зона входа:</b> ${zone['low']:.2f} - ${zone['high']:.2f}\n"
+            f"🔴 <b>Стоп-лосс:</b> ${stop_loss:.2f}\n"
+            f"🟢 <b>Тейк-профит:</b> ${take_profit:.2f}\n"
+            f"📊 <b>Риск/Прибыль:</b> 1:{rr_ratio:.1f}\n"
+            f"🎯 <b>Уверенность:</b> {signal['confidence'] * 100:.1f}%\n"
+            f"📈 <b>Тренд:</b> {signal['trend']}\n"
             f"⏰ <b>Время:</b> {signal['time'].strftime('%H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 <b>Таймфреймы:</b> {self.senior_tf}→{self.medium_tf}→{self.junior_tf}\n"
+            f"📊 <b>Статистика:</b> сигналов сегодня: {self.signals_sent_today}\n"
+            f"🤖 <b>Режим:</b> {self.senior_tf}→{self.medium_tf}→{self.junior_tf}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <i>Стоп-лосс: за пределами зоны</i>"
+            f"⚠️ <i>Риск-менеджмент: не более 2% капитала</i>"
         )
 
         return message
@@ -464,7 +517,7 @@ class DynamicLevelBot:
 
     def check_and_notify(self):
         """
-        Проверяет рынок и отправляет уведомления
+        Проверяет рынок и отправляет уведомления с защитой от дублирования
         """
         signal, trend, zone = self.analyze_market()
 
@@ -476,24 +529,50 @@ class DynamicLevelBot:
 
         # Отправляем сигнал, если есть
         if signal:
+            # Проверяем на дубликат
+            if self._is_duplicate_signal(signal):
+                print(f"⏺ Сигнал {signal['trend']} @ ${signal['price']:.2f} пропущен (дубликат)")
+                return
+
+            # Отправляем сигнал
             msg = self.format_signal_message(signal)
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(telegram.send_message(msg))
                 loop.close()
-                print(f"✅ СИГНАЛ ОТПРАВЛЕН!")
-            except Exception as e:
-                print(f"❌ Ошибка Telegram: {e}")
 
-        # Отправляем обновление зоны (каждые 30 минут или при сильном изменении)
+                # Запоминаем отправленный сигнал
+                self.last_signal_time = datetime.now()
+                self.last_signal_price = signal['price']
+                self.last_signal_action = signal['trend']
+                self.signals_sent_today += 1
+                self.signals_sent += 1
+
+                print(f"✅ СИГНАЛ {signal['trend']} ОТПРАВЛЕН! (№{self.signals_sent})")
+
+                # Очищаем зону после сигнала, чтобы не было дублей
+                self.waiting_for_entry = False
+                self.entry_zone = None
+
+            except Exception as e:
+                print(f"❌ Ошибка отправки: {e}")
+
+        # Отправляем обновление зоны (не чаще чем раз в 30 минут)
         elif zone and (self.total_checks % 30 == 0 or self.zones_created % 5 == 0):
+            # Проверяем, не отправляли ли зону недавно
+            if self.last_zone_notification:
+                time_since_last_zone = (datetime.now() - self.last_zone_notification).total_seconds() / 60
+                if time_since_last_zone < 15:  # не чаще раза в 15 минут
+                    return
+
             msg = self.format_zone_update_message(zone, trend)
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(telegram.send_message(msg))
                 loop.close()
+                self.last_zone_notification = datetime.now()
             except:
                 pass
 
@@ -509,7 +588,9 @@ class DynamicLevelBot:
         print(f"Проверок: {self.total_checks}")
         print(f"Зон создано: {self.zones_created}")
         print(f"Зон отменено: {self.zones_cancelled}")
-        print(f"Сигналов: {self.signals_sent}")
+        print(f"Сигналов отправлено: {self.signals_sent}")
+        print(f"Дубликатов пропущено: {self.duplicates_skipped}")
+        print(f"Сигналов сегодня: {self.signals_sent_today}")
         print(f"Текущий тренд: {self.current_trend}")
         print(f"{'=' * 50}\n")
 
@@ -517,7 +598,9 @@ class DynamicLevelBot:
         """Запускает непрерывный мониторинг"""
         print(f"\n🚀 ЗАПУСК МОНИТОРИНГА")
         print(f"Проверка каждую минуту")
-        print(f"Нажмите Ctrl+C для остановки\n")
+        print(f"Интервал между сигналами: {self.cooldown_minutes} мин")
+        print(f"Допуск по цене: ${self.price_tolerance}")
+        print("Нажмите Ctrl+C для остановки\n")
 
         # Стартовое сообщение
         try:
@@ -527,11 +610,12 @@ class DynamicLevelBot:
                 f"🚀 <b>Бот с динамическими уровнями запущен</b>\n"
                 f"Инструмент: {self.symbol_name}\n"
                 f"Тренд: {self.senior_tf} → Зона: {self.medium_tf} → Вход: {self.junior_tf}\n"
-                f"Ширина зоны: ±{self.zone_width_pct}%"
+                f"Ширина зоны: ±{self.zone_width_pct}%\n"
+                f"Интервал между сигналами: {self.cooldown_minutes} мин"
             ))
             loop.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить стартовое сообщение: {e}")
 
         try:
             while True:
@@ -552,7 +636,8 @@ class DynamicLevelBot:
                 loop.run_until_complete(telegram.send_message(
                     f"🛑 <b>Бот остановлен</b>\n"
                     f"Проверок: {self.total_checks}\n"
-                    f"Сигналов: {self.signals_sent}"
+                    f"Сигналов: {self.signals_sent}\n"
+                    f"Дубликатов пропущено: {self.duplicates_skipped}"
                 ))
                 loop.close()
             except:
@@ -572,6 +657,10 @@ def main():
                         help='Ширина зоны в %')
     parser.add_argument('--confidence', '-c', type=float, default=0.75,
                         help='Порог уверенности')
+    parser.add_argument('--cooldown', '-cd', type=int, default=15,
+                        help='Интервал между сигналами (минуты)')
+    parser.add_argument('--tolerance', '-tol', type=float, default=5.0,
+                        help='Допуск по цене для дубликатов ($)')
     parser.add_argument('--test', '-t', action='store_true',
                         help='Тестовый режим')
 
@@ -586,6 +675,10 @@ def main():
         confidence_threshold=args.confidence,
         use_real_mt5=not args.test
     )
+
+    # Передаем дополнительные параметры
+    bot.cooldown_minutes = args.cooldown
+    bot.price_tolerance = args.tolerance
 
     bot.run()
 
