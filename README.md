@@ -21,5 +21,5 @@
 ### 1. Клонирование репозитория
 
 ```bash
-git clone https://github.com/yourusername/ml-trading-backtester.git
+git clone https://github.com/StepanMelikyan/ml-trading-backtester.git
 cd ml-trading-backtester
