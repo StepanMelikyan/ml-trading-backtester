@@ -23,3 +23,9 @@
 ```bash
 git clone https://github.com/StepanMelikyan/ml-trading-backtester.git
 cd ml-trading-backtester
+
+
+## 📋 Полный справочник команд
+
+Все доступные команды и примеры использования собраны в отдельном файле:
+👉 **[COMMANDS.md](COMMANDS.md)** - подробное описание всех скриптов и параметров
